@@ -23,7 +23,10 @@ _REF = _hidden_ref()
 cdef extern from "Simplify.h" namespace "Simplify" :
     void simplify_mesh( int target_count, int update_rate, double aggressiveness,
                         void (*log)(char*, int), int max_iterations,double alpha, int K,
-                        bool lossless, double threshold_lossless, bool preserve_border)
+                        bool lossless, double threshold_lossless, bool preserve_border,
+                        double* custom_quadratics_param, int custom_quadratics_size_param,
+                        int* target_vertex_ids, int target_vertex_ids_size,
+                        double min_edge_length)
     void simplify_mesh_lossless(void (*log)(char*, int), double epsilon, int max_iterations, bool preserve_border)
     void setMeshFromExt(vector[vector[double]] vertices, vector[vector[int]] faces)
     vector[vector[int]] getFaces()
@@ -123,7 +126,9 @@ cdef class Simplify :
     cpdef void simplify_mesh(self, int target_count = 100, int update_rate = 5,
         double aggressiveness=7., max_iterations = 100, bool verbose=True,
         bool lossless = False, double threshold_lossless=1e-3, double alpha = 1e-9,
-        int K = 3, bool preserve_border = True):
+        int K = 3, bool preserve_border = True,
+        custom_quadratics=None, target_vertex_ids=None,
+        double min_edge_length=-1.0):
         """Simplify mesh
 
             Parameters
@@ -151,6 +156,11 @@ cdef class Simplify :
                 Parameter for controlling the thresold growth
             preserve_border : Bool
                 Flag for preserving vertices on open border
+            custom_quadratics : np.ndarray, optional
+                Per-vertex custom quadratic matrices to add to initialization.
+                Shape: (n_vertices, 10) where each row contains the 10 unique
+                values of a symmetric 4x4 matrix in order:
+                [m11, m12, m13, m14, m22, m23, m24, m33, m34, m44]
 
             Note
             ----
@@ -158,21 +168,58 @@ cdef class Simplify :
         """
 
         cdef void (*log)(char*, int) noexcept
+        cdef double* quadratics_ptr = NULL
+        cdef int quadratics_size = 0
+        cdef np.ndarray[double, ndim=2, mode="c"] custom_quadratics_arr  # Declare typed variable
+        cdef int* target_vertex_ids_ptr = NULL
+        cdef int target_vertex_ids_size = 0
+        cdef np.ndarray[int, ndim=1, mode="c"] target_vertex_ids_arr  # Declare typed variable
 
         log = NULL
         if verbose:
             log = log_message
 
+        # Handle custom_quadratics if provided
+        if custom_quadratics is not None:
+            # Convert to typed NumPy array
+            custom_quadratics_arr = np.ascontiguousarray(custom_quadratics, dtype=np.float64)
+
+            # Validate shape
+            if custom_quadratics_arr.shape[1] != 10:
+                raise ValueError("custom_quadratics must have shape (n_vertices, 10), got shape ({}, {})".format(
+                    custom_quadratics_arr.shape[0], custom_quadratics_arr.shape[1]))
+            if custom_quadratics_arr.shape[0] != self.vertices_mv.shape[0]:
+                raise ValueError("custom_quadratics has {} rows, but mesh has {} vertices".format(
+                    custom_quadratics_arr.shape[0], self.vertices_mv.shape[0]))
+
+            quadratics_ptr = <double*>&custom_quadratics_arr[0, 0]
+            quadratics_size = custom_quadratics_arr.shape[0] * 10
+
+        # Handle target_vertex_ids if provided
+        if target_vertex_ids is not None:
+            target_vertex_ids_arr = np.ascontiguousarray(target_vertex_ids, dtype=np.int32)
+
+            if target_vertex_ids_arr.shape[0] != self.vertices_mv.shape[0]:
+                raise ValueError("target_vertex_ids has {} elements, but mesh has {} vertices".format(
+                    target_vertex_ids_arr.shape[0], self.vertices_mv.shape[0]))
+
+            target_vertex_ids_ptr = <int*>&target_vertex_ids_arr[0]
+            target_vertex_ids_size = target_vertex_ids_arr.shape[0]
+
         N_start = self.faces_mv.shape[0]
         t_start = _time()
+
         simplify_mesh(target_count, update_rate, aggressiveness, log, max_iterations, alpha, K,
-                      lossless, threshold_lossless, preserve_border)
+                      lossless, threshold_lossless, preserve_border,
+                      quadratics_ptr, quadratics_size,
+                      target_vertex_ids_ptr, target_vertex_ids_size,
+                      min_edge_length)
+        
         t_end = _time()
         N_end = getFaces().size()
 
         if verbose:
             from logging import getLogger
-
             getLogger("pyfqmr_triflow").debug('simplified mesh in {} seconds from {} to {} triangles'.format(
                 round(t_end-t_start,4), N_start, N_end)
             )

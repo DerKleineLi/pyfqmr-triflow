@@ -301,6 +301,19 @@ class SymetricMatrix {
     return *this;
   }
 
+  // Scale matrix by a factor (e.g., border_weight)
+  SymetricMatrix operator*(const double s) const {
+    return SymetricMatrix(m[0] * s, m[1] * s, m[2] * s, m[3] * s,
+                          m[4] * s, m[5] * s, m[6] * s,
+                          m[7] * s, m[8] * s,
+                          m[9] * s);
+  }
+
+  SymetricMatrix& operator*=(const double s) {
+    loopi(0, 10) m[i] *= s;
+    return *this;
+  }
+
   double m[10];
 };
 ///////////////////////////////////////////
@@ -314,14 +327,23 @@ namespace Simplify
     TEXCOORD = 4,
     COLOR = 8
   };
-  struct Triangle { int v[3];double err[4];int deleted,dirty,attr;vec3f n;vec3f uvs[3];int material; };
-  struct Vertex { vec3f p;int tstart,tcount;SymetricMatrix q;int border;};
+  struct Triangle { int v[3];double err[4];int deleted,dirty,attr;vec3f n;vec3f uvs[3];int material;int border[3]; };
+  struct Vertex { vec3f p;int tstart,tcount;SymetricMatrix q;SymetricMatrix custom_q;int border;double area; int tid; };
   struct Ref { int tid,tvertex; };
   std::vector<Triangle> triangles;
   std::vector<Vertex> vertices;
   std::vector<Ref> refs;
     std::string mtllib; //
     std::vector<std::string> materials; //
+  
+  double* custom_quadratics;
+  int custom_quadratics_size;
+  bool has_target_vertex_ids = false;
+  bool override_quadratics = false;
+  double minimum_edge_length = -1.0;
+
+  double border_weight = 1000.0; // weight for border vertices
+  int binary_search_steps = 0; // steps for binary search when optimal position causes a flip
 
   // Helper functions
 
@@ -330,7 +352,7 @@ namespace Simplify
   bool flipped(vec3f p,int i0,int i1,Vertex &v0,Vertex &v1,std::vector<int> &deleted);
   void update_uvs(int i0,const Vertex &v,const vec3f &p,std::vector<int> &deleted);
   void update_triangles(int i0,Vertex &v,std::vector<int> &deleted,int &deleted_triangles);
-  void update_mesh(int iteration);
+  void update_mesh(int iteration,void (*log)(char*, int));
   void compact_mesh();
   //
   // Main simplification function
@@ -344,8 +366,21 @@ namespace Simplify
   void simplify_mesh(int target_count, int update_rate=5, double agressiveness=7,
                      void (*log)(char*, int)=NULL, int max_iterations=100, double alpha = 0.000000001,
                      int K = 3, bool lossless=false, double threshold_lossless = 0.0001,
-                     bool preserve_border = false)
+                     bool preserve_border = false,
+                     double* custom_quadratics_param = nullptr, int custom_quadratics_size_param = 0,
+                     int* target_vertex_ids = nullptr, int target_vertex_ids_size = 0,
+                     double min_edge_length = -1.0)
   {
+    custom_quadratics = custom_quadratics_param;
+    custom_quadratics_size = custom_quadratics_size_param;
+    if (target_vertex_ids != nullptr) {
+        has_target_vertex_ids = true;
+        loopi(0, vertices.size()) {
+            vertices[i].tid = target_vertex_ids[i];
+        }
+    }
+    minimum_edge_length = min_edge_length;
+
     // init
     loopi(0,triangles.size())
         {
@@ -356,6 +391,7 @@ namespace Simplify
     int deleted_triangles=0;
     std::vector<int> deleted0,deleted1;
     int triangle_count=triangles.size();
+    int previous_deleted_triangles = deleted_triangles;
     //int iteration = 0;
     //loop(iteration,0,100)
     for (int iteration = 0; iteration < max_iterations; iteration ++)
@@ -365,7 +401,7 @@ namespace Simplify
       // update mesh once in a while
       if((iteration%update_rate==0) || lossless)
       {
-        update_mesh(iteration);
+        update_mesh(iteration, log);
       }
 
       // clear dirty flag
@@ -379,8 +415,8 @@ namespace Simplify
       //
       double threshold = alpha*pow(double(iteration+K),agressiveness);
       if(lossless) threshold = threshold_lossless ;
+      else threshold = min(threshold, threshold_lossless );
 
-      // target number of triangles reached ? Then break
       if ((log) && (iteration%5==0)) {
         char message[128];
         snprintf(message, 127, "iteration %d - triangles %d threshold %g",iteration,triangle_count-deleted_triangles, threshold);
@@ -399,21 +435,174 @@ namespace Simplify
         {
           int i0=t.v[ j     ]; Vertex &v0 = vertices[i0];
           int i1=t.v[(j+1)%3]; Vertex &v1 = vertices[i1];
+
+          if (has_target_vertex_ids && v0.tid != -1 && v1.tid == -1) {
+            continue; // only allow collapsing towards skeleton
+          }
+
+          if (has_target_vertex_ids && v0.tid != i0 && v1.tid == i1) {
+            continue; // only allow collapsing towards seed
+          }
+
           // Border check //Added preserve_border method from issue 14
           if(preserve_border){
             if (v0.border || v1.border) continue; // should keep border vertices
           }
-          else
-            if (v0.border != v1.border)  continue; // base behaviour
+          if (v0.border && v1.border && !t.border[j]) continue; // prevent collapsing two sides of a border
+
+          if (has_target_vertex_ids && v0.tid != v1.tid && v0.tid != -1 && v1.tid != -1) {
+              if ((v0.p - v1.p).length() > minimum_edge_length) {
+                  continue;
+              }
+
+              int target_tid = v1.tid;
+              int max_neighbors = v1.tcount * 2;
+              
+              int* group_neighbors = new int[max_neighbors];
+              int* parent = new int[max_neighbors]; 
+              int group_neighbor_count = 0;
+
+              auto get_or_create_local_id = [&](int global_id) {
+                  for (int n_idx = 0; n_idx < group_neighbor_count; n_idx++) 
+                      if (group_neighbors[n_idx] == global_id) return n_idx;
+                  
+                  group_neighbors[group_neighbor_count] = global_id;
+                  parent[group_neighbor_count] = group_neighbor_count;
+                  return group_neighbor_count++;
+              };
+
+              auto find_root = [&](int node, auto& self) -> int {
+                  if (parent[node] == node) return node;
+                  return parent[node] = self(parent[node], self);
+              };
+
+              for (int m = 0; m < v1.tcount; m++) {
+                  Triangle &t_ring = triangles[refs[v1.tstart + m].tid];
+                  if (t_ring.deleted) continue;
+
+                  int va = -1, vb = -1;
+                  for (int n = 0; n < 3; n++) {
+                      if (t_ring.v[n] != i1) {
+                          if (va == -1) va = t_ring.v[n];
+                          else vb = t_ring.v[n];
+                      }
+                  }
+                  
+                  int la = -1, lb = -1;
+                  // Register all neighbors belonging to the target group
+                  if (va != -1 && vertices[va].tid == target_tid) la = get_or_create_local_id(va);
+                  if (vb != -1 && vertices[vb].tid == target_tid) lb = get_or_create_local_id(vb);
+
+                  // If both are in target_tid, union them
+                  if (la != -1 && lb != -1) {
+                      int root_a = find_root(la, find_root);
+                      int root_b = find_root(lb, find_root);
+                      if (root_a != root_b) parent[root_a] = root_b;
+                  }
+              }
+
+              bool split_detected = false;
+              if (group_neighbor_count > 1) {
+                  int final_root = find_root(0, find_root);
+                  for (int m = 1; m < group_neighbor_count; m++) {
+                      if (find_root(m, find_root) != final_root) {
+                          split_detected = true;
+                          break;
+                      }
+                  }
+              }
+
+              delete[] group_neighbors;
+              delete[] parent;
+
+              if (split_detected) {
+                  continue;
+              }
+          }
+
+          // check for manifold constraint
+          if (true) {
+              int max_v0_neighbors = v0.tcount * 2;
+              int* v0_neighbors = new int[max_v0_neighbors];
+              bool* is_safe = new bool[max_v0_neighbors];
+              int v0_n_count = 0;
+
+              // Helper: Finds the local index of a vertex
+              auto get_neighbor_index = [&](int vid) -> int {
+                  for (int n_idx = 0; n_idx < v0_n_count; n_idx++) {
+                      if (v0_neighbors[n_idx] == vid) return n_idx;
+                  }
+                  return -1;
+              };
+
+              // Helper: Adds or updates a neighbor's safety status
+              auto update_neighbor = [&](int vid, bool safe) {
+                  if (vid == i0 || vid == i1) return;
+                  int ex = get_neighbor_index(vid);
+                  if (ex == -1) {
+                      if (v0_n_count < max_v0_neighbors) {
+                          v0_neighbors[v0_n_count] = vid;
+                          is_safe[v0_n_count] = safe;
+                          v0_n_count++;
+                      }
+                  } else {
+                      // If it's part of ANY shared triangle, it's safe
+                      if (safe) is_safe[ex] = true;
+                  }
+              };
+
+              // 1. Pass through v0's triangles to build the "Link" map
+              for (int m = 0; m < v0.tcount; m++) {
+                  Triangle &t_v0 = triangles[refs[v0.tstart + m].tid];
+                  if (t_v0.deleted) continue;
+
+                  bool shares_with_v1 = false;
+                  for (int n = 0; n < 3; n++) {
+                      if (t_v0.v[n] == i1) { shares_with_v1 = true; break; }
+                  }
+
+                  for (int n = 0; n < 3; n++) update_neighbor(t_v0.v[n], shares_with_v1);
+              }
+
+              // 2. Check v1's neighbors against the list
+              bool pinch_detected = false;
+              for (int m = 0; m < v1.tcount; m++) {
+                  Triangle &t_v1 = triangles[refs[v1.tstart + m].tid];
+                  if (t_v1.deleted) continue;
+
+                  for (int n = 0; n < 3; n++) {
+                      int vid = t_v1.v[n];
+                      if (vid == i0 || vid == i1) continue;
+
+                      int ex = get_neighbor_index(vid);
+                      // If vid is a neighbor of both, but NOT marked safe, it's a non-manifold pinch
+                      if (ex != -1 && !is_safe[ex]) {
+                          pinch_detected = true;
+                          break;
+                      }
+                  }
+                  if (pinch_detected) break;
+              }
+
+              delete[] v0_neighbors;
+              delete[] is_safe;
+
+              if (pinch_detected) {
+                  continue;
+              }
+          }
 
           // Compute vertex to collapse to
           vec3f p;
           calculate_error(i0,i1,p);
           deleted0.resize(v0.tcount); // normals temporarily
           deleted1.resize(v1.tcount); // normals temporarily
-          // don't remove if flipped
-          if( flipped(p,i0,i1,v0,v1,deleted0) ) continue;
-          if( flipped(p,i1,i0,v1,v0,deleted1) ) continue;
+
+          // Call flipped() for its side effect of populating deleted0/deleted1.
+          // Flip rejection is intentionally disabled; the optimal-position
+          // safety fallback in calculate_error handles runaway points instead.
+          flipped(p,i0,i1,v0,v1,deleted0);
+          flipped(p,i1,i0,v1,v0,deleted1);
 
           if ( (t.attr & TEXCOORD) == TEXCOORD  )
           {
@@ -424,6 +613,60 @@ namespace Simplify
           // not flipped, so remove edge
           v0.p=p;
           v0.q=v1.q+v0.q;
+          if ( custom_quadratics != nullptr && custom_quadratics_size > 0 )
+          {
+              // v0.custom_q = v0.custom_q[0] > v1.custom_q[0] ? v0.custom_q : v1.custom_q;
+              v0.custom_q = v0.custom_q + v1.custom_q;
+          }
+          v0.area = v0.area + v1.area;
+          if (v1.tid == i1){
+            loopk(0, vertices.size()){
+              if (vertices[k].tid == i1){
+                vertices[k].tid = i0;
+              }
+            }
+          }
+          // update border
+          bool was_v0_border = v0.border;
+          bool was_v1_border = v1.border;
+          if (was_v1_border) v0.border = true;
+          if (!was_v0_border && was_v1_border) {
+            int max_triangles = v1.tcount * 2;
+            int* anchor_vertices = new int[max_triangles];
+            int anchor_count = 0;
+
+            for (int k = 0; k < v1.tcount; k++) {
+              Triangle &t = triangles[refs[v1.tstart + k].tid];
+              if (t.deleted || !deleted1[k]) continue;
+              for (int m = 0; m < 3; m++) {
+                if (!t.border[m]) continue;
+                int va = t.v[m];
+                int vb = t.v[(m + 1) % 3];
+                int v_other = (va == i1) ? vb : (vb == i1) ? va : -1;
+                if (v_other == -1 || v_other == i0) continue;
+                // add to anchor list
+                anchor_vertices[anchor_count++] = v_other;
+              }
+            }
+
+            for (int k = 0; k < v0.tcount; k++) {
+              Triangle &t = triangles[refs[v0.tstart + k].tid];
+              if (t.deleted || deleted0[k]) continue;
+              for (int m = 0; m < 3; m++) {
+                int va = t.v[m];
+                int vb = t.v[(m + 1) % 3];
+                int v_other = (va == i0) ? vb : (vb == i0) ? va : -1;
+                if (v_other == -1) continue;
+                for (int n = 0; n < anchor_count; n++) {
+                  if (v_other == anchor_vertices[n]) {
+                    t.border[m] = true;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
           int tstart=refs.size();
 
           update_triangles(i0,v0,deleted0,deleted_triangles);
@@ -444,11 +687,19 @@ namespace Simplify
           break;
         }
         // done?
-        if (lossless && (deleted_triangles<=0)){ break;
-        } else if (!lossless && (triangle_count-deleted_triangles<=target_count)){break;}
+        if (!lossless && (triangle_count-deleted_triangles<=target_count)){break;}
 
-        if (lossless) deleted_triangles = 0;
+        // if (lossless) deleted_triangles = 0;
       }
+
+      // done?
+      if (lossless && (previous_deleted_triangles==deleted_triangles)){ break;
+      } else if (!lossless && (triangle_count-deleted_triangles<=target_count)){break;
+      } else if (!lossless && (previous_deleted_triangles==deleted_triangles) && threshold >= threshold_lossless ) {
+        break;
+      }
+      
+      previous_deleted_triangles = deleted_triangles;
     }
     // clean up mesh
     compact_mesh();
@@ -470,7 +721,7 @@ namespace Simplify
     for (int iteration = 0; iteration < max_iterations; iteration ++)
     {
       // update mesh constantly
-      update_mesh(iteration);
+      update_mesh(iteration, log);
       // clear dirty flag
       loopi(0,triangles.size()) triangles[i].dirty=0;
       //
@@ -558,10 +809,10 @@ namespace Simplify
 
   bool flipped(vec3f p,int i0,int i1,Vertex &v0,Vertex &v1,std::vector<int> &deleted)
   {
-
+    bool is_flipped=false;
     loopk(0,v0.tcount)
     {
-      Triangle &t=triangles[refs[v0.tstart+k].tid];
+      Triangle &t=triangles[refs[v0.tstart+k].tid]; // for each adjacent triangle of v0
       if(t.deleted)continue;
 
       int s=refs[v0.tstart+k].tvertex;
@@ -570,20 +821,22 @@ namespace Simplify
 
       if(id1==i1 || id2==i1) // delete ?
       {
-
         deleted[k]=1;
         continue;
+      }else{
+        deleted[k]=0;
       }
+
       vec3f d1 = vertices[id1].p-p; d1.normalize();
       vec3f d2 = vertices[id2].p-p; d2.normalize();
-      if(fabs(d1.dot(d2))>0.999) return true;
+      if(fabs(d1.dot(d2))>0.999) is_flipped=true;
       vec3f n;
       n.cross(d1,d2);
       n.normalize();
-      deleted[k]=0;
-      if(n.dot(t.n)<0.2) return true;
+      // deleted[k]=0;
+      if(n.dot(t.n)<0.2) is_flipped=true;
     }
-    return false;
+    return is_flipped;
   }
 
     // update_uvs
@@ -631,7 +884,7 @@ namespace Simplify
 
   // compact triangles, compute edge error and build reference list
 
-  void update_mesh(int iteration)
+  void update_mesh(int iteration, void (*log)(char*, int)=NULL)
   {
     if(iteration>0) // compact triangles
     {
@@ -645,6 +898,11 @@ namespace Simplify
     }
 
     // Init Reference ID list
+    if ((log) && (iteration%5==0)) {
+      char message[128];
+      snprintf(message, 127, "Init Reference ID list");
+      log(message, 128);
+    }
     loopi(0,vertices.size())
     {
       vertices[i].tstart=0;
@@ -665,6 +923,11 @@ namespace Simplify
     }
 
     // Write References
+    if ((log) && (iteration%5==0)) {
+      char message[128];
+      snprintf(message, 127, "Write References");
+      log(message, 128);
+    }
     refs.resize(triangles.size()*3);
     loopi(0,triangles.size())
     {
@@ -679,26 +942,39 @@ namespace Simplify
     }
 
     // Identify boundary : vertices[].border=0,1
+    if ((log) && (iteration%5==0)) {
+      char message[128];
+      snprintf(message, 127, "Identify boundary");
+      log(message, 128);
+    }
     if( iteration == 0 )
     {
       std::vector<int> vcount,vids;
 
       loopi(0,vertices.size())
         vertices[i].border=0;
+      loopi(0,triangles.size())
+      {
+        Triangle &t=triangles[i];
+        loopj(0,3)
+        {
+          t.border[j]=0;
+        }
+      }
 
       loopi(0,vertices.size())
       {
-        Vertex &v=vertices[i];
+        Vertex &v=vertices[i]; // for each vertex
         vcount.clear();
         vids.clear();
-        loopj(0,v.tcount)
+        loopj(0,v.tcount) 
         {
           int k=refs[v.tstart+j].tid;
-          Triangle &t=triangles[k];
+          Triangle &t=triangles[k]; // for each adjacent triangle
           loopk(0,3)
           {
-            int ofs=0,id=t.v[k];
-            while(ofs<vcount.size())
+            int ofs=0,id=t.v[k]; // for each vertex of triangle
+            while(ofs<vcount.size()) // ofs: index in vcount/vids of the current vertex
             {
               if(vids[ofs]==id)break;
               ofs++;
@@ -714,6 +990,30 @@ namespace Simplify
         }
         loopj(0,vcount.size()) if(vcount[j]==1)
           vertices[vids[j]].border=1;
+        loopj(0,v.tcount) 
+        {
+          int k=refs[v.tstart+j].tid;
+          Triangle &t=triangles[k]; // for each adjacent triangle
+          loopk(0,3)
+          {
+            int id1=t.v[k];
+            int id2=t.v[(k+1)%3];
+            int other_id;
+            
+            if ( id1 == i ) other_id = id2;
+            else if ( id2 == i ) other_id = id1;
+            else continue;
+
+            int ofs=0;
+            while(ofs<vcount.size()) // ofs: index in vcount/vids of the current vertex
+            {
+              if(vids[ofs]==other_id)break;
+              ofs++;
+            }
+
+            if(ofs<vcount.size() && vcount[ofs]==1) t.border[k]=1;
+          }
+        }
       }
     }
 
@@ -726,19 +1026,99 @@ namespace Simplify
     //
     if( iteration == 0 )
     {
-      loopi(0,vertices.size())
-      vertices[i].q=SymetricMatrix(0.0);
-
+      if ((log) && (iteration%5==0)) {
+        char message[128];
+        snprintf(message, 127, "Init Quadrics");
+        log(message, 128);
+      }
+      loopi(0,vertices.size()){
+        vertices[i].q=SymetricMatrix(0.0);
+        vertices[i].area = 0.0;
+      }
       loopi(0,triangles.size())
       {
         Triangle &t=triangles[i];
         vec3f n,p[3];
         loopj(0,3) p[j]=vertices[t.v[j]].p;
         n.cross(p[1]-p[0],p[2]-p[0]);
+        double area = n.length() * 0.5;
         n.normalize();
         t.n=n;
-        loopj(0,3) vertices[t.v[j]].q =
-          vertices[t.v[j]].q+SymetricMatrix(n.x,n.y,n.z,-n.dot(p[0]));
+        loopj(0,3) {
+          vertices[t.v[j]].area += area;
+          // distance to plane
+          vertices[t.v[j]].q = vertices[t.v[j]].q+SymetricMatrix(n.x,n.y,n.z,-n.dot(p[0]));
+          // distance to plane orthogonal to triangle
+          if ( border_weight > 0.0 && t.border[j] )
+          {
+            vec3f edge = p[(j + 1) % 3] - p[j];
+            edge.normalize();
+            
+            vec3f nb; // Boundary normal
+            nb.cross(t.n, edge);
+            nb.normalize();
+            float d = -nb.dot(p[j]);
+
+            // Add orthogonal plane quadric to both vertices of the edge
+            SymetricMatrix q_border(nb.x, nb.y, nb.z, d);
+            vertices[t.v[j]].q = vertices[t.v[j]].q + (q_border * border_weight);
+            vertices[t.v[(j + 1) % 3]].q = vertices[t.v[(j + 1) % 3]].q + (q_border * border_weight);
+          }
+        }
+      }
+
+      // apply custom quadratics if provided
+      if ((log) && (iteration%5==0)) {
+        char message[128];
+        snprintf(message, 127, "apply custom quadratics if provided");
+        log(message, 128);
+      }
+      if (custom_quadratics != nullptr && custom_quadratics_size > 0)
+      {
+        loopi(0, vertices.size())
+        {
+          // Ensure we don't go out of bounds
+          // custom_quadratics should be 10*n_vertices (10 values per vertex for symmetric matrix)
+          int offset = i * 10;
+          if (offset + 9 < custom_quadratics_size)
+          {
+            // Create symmetric matrix from the 10 values
+            // Order: m11, m12, m13, m14, m22, m23, m24, m33, m34, m44
+            SymetricMatrix custom_q(
+                custom_quadratics[offset + 0],  // m11
+                custom_quadratics[offset + 1],  // m12
+                custom_quadratics[offset + 2],  // m13
+                custom_quadratics[offset + 3],  // m14
+                custom_quadratics[offset + 4],  // m22
+                custom_quadratics[offset + 5],  // m23
+                custom_quadratics[offset + 6],  // m24
+                custom_quadratics[offset + 7],  // m33
+                custom_quadratics[offset + 8],  // m34
+                custom_quadratics[offset + 9]   // m44
+            );
+            // if (override_quadratics) vertices[i].q = custom_q;
+            // else vertices[i].q = vertices[i].q + custom_q;
+            vertices[i].custom_q = custom_q;
+          }
+        }
+      }
+
+      // weight quadratics by area
+      loopi(0, vertices.size()) {
+        double area = vertices[i].area;
+        if (area > 0.0) {
+          vertices[i].q *= area;
+          if ( custom_quadratics != nullptr && custom_quadratics_size > 0 )
+          {
+              vertices[i].custom_q *= area;
+          }
+        }
+      }
+
+      if ((log) && (iteration%5==0)) {
+        char message[128];
+        snprintf(message, 127, "Calc Edge Error");
+        log(message, 128);
       }
       loopi(0,triangles.size())
       {
@@ -798,33 +1178,91 @@ namespace Simplify
   {
     // compute interpolated vertex
 
+    SymetricMatrix q_geom = vertices[id_v1].q + vertices[id_v2].q;
     SymetricMatrix q = vertices[id_v1].q + vertices[id_v2].q;
+    if ( custom_quadratics != nullptr && custom_quadratics_size > 0 )
+    {
+        q += vertices[id_v1].custom_q + vertices[id_v2].custom_q;
+    }
     bool   border = vertices[id_v1].border & vertices[id_v2].border;
     double error=0;
     double det = q.det(0, 1, 2, 1, 4, 5, 2, 5, 7);
-    if ( det != 0 && !border )
+    bool fallback = det < 1e-6 ;
+    bool is_flipped = false;
+    if ( !fallback ) // det != 0 && !border
     {
       // q_delta is invertible
       p_result.x = -1/det*(q.det(1, 2, 3, 4, 5, 6, 5, 7 , 8));  // vx = A41/det(q_delta)
       p_result.y =  1/det*(q.det(0, 2, 3, 1, 5, 6, 2, 7 , 8));  // vy = A42/det(q_delta)
       p_result.z = -1/det*(q.det(0, 1, 3, 1, 4, 6, 2, 5,  8));  // vz = A43/det(q_delta)
       error = vertex_error(q, p_result.x, p_result.y, p_result.z);
+
+      vec3f p1 = vertices[id_v1].p;
+      vec3f p2 = vertices[id_v2].p;
+      vec3f p_mid = (p1 + p2) / 2.0f;
+      double edge_length = (p1 - p2).length();
+      double opt_length = (p_result - p_mid).length();
+      if ( opt_length > edge_length * 2.0 ) {
+        // if the optimal point is too far from the edge, it's likely to cause flips or other issues, so we fallback to the midpoint
+        fallback = true;
+      }
     }
-    else
+    if ( fallback )
     {
-      // det = 0 -> try to find best result
-      vec3f p1=vertices[id_v1].p;
-      vec3f p2=vertices[id_v2].p;
-      vec3f p3=(p1+p2)/2;
-      double error1 = vertex_error(q, p1.x,p1.y,p1.z);
-      double error2 = vertex_error(q, p2.x,p2.y,p2.z);
-      double error3 = vertex_error(q, p3.x,p3.y,p3.z);
-      error = min(error1, min(error2, error3));
-      if (error1 == error) p_result=p1;
-      if (error2 == error) p_result=p2;
-      if (error3 == error) p_result=p3;
+      // 1. Find the initial "Safe" point among v1, v2, and midpoint
+      vec3f p1 = vertices[id_v1].p;
+      vec3f p2 = vertices[id_v2].p;
+      vec3f p_safe = (p1 + p2) / 2.0f; 
+      
+      double error1 = vertex_error(q, p1.x, p1.y, p1.z);
+      double error2 = vertex_error(q, p2.x, p2.y, p2.z);
+      double error3 = vertex_error(q, p_safe.x, p_safe.y, p_safe.z);
+      
+      double best_safe_error = error3;
+      if (error1 < best_safe_error) { p_safe = p1; best_safe_error = error1; }
+      if (error2 < best_safe_error) { p_safe = p2; best_safe_error = error2; }
+
+      if (is_flipped) { // there was an optimal point but it caused a flip
+
+        // 2. Prepare for Binary Search
+        // We know p_result (the optimal) flips, and p_safe is our fallback.
+        vec3f p_opt = p_result; 
+        Vertex &v0 = vertices[id_v1];
+        Vertex &v1 = vertices[id_v2];
+        std::vector<int> deleted0(v0.tcount), deleted1(v1.tcount);
+
+        // 3. Binary Search Iterations
+        loopi(0, binary_search_steps){
+          vec3f p_test = (p_opt + p_safe) / 2.0f;
+          
+          // Check if this interpolated point causes a flip
+          if (flipped(p_test, id_v1, id_v2, v0, v1, deleted0) || 
+              flipped(p_test, id_v2, id_v1, v1, v0, deleted1)) 
+          {
+            // Still flipping: move p_opt closer to the safe point
+            p_opt = p_test;
+          } 
+          else 
+          {
+            // Not flipping: move p_safe closer to the optimal point
+            p_safe = p_test;
+          }
+        }
+
+        // 4. Set final result to the best non-flipping point found
+        p_result = p_safe;
+        error = vertex_error(q, p_result.x, p_result.y, p_result.z);
+      }else{
+        error = best_safe_error;
+        p_result = p_safe;
+      }
     }
-    return error;
+
+    double raw_geom_error = vertex_error(q_geom, p_result.x, p_result.y, p_result.z);
+    double total_area = vertices[id_v1].area + vertices[id_v2].area;
+    double normalized_error = raw_geom_error / (total_area + 1e-6); // avoid division by zero
+
+    return normalized_error;
   }
 
   char *trimwhitespace(char *str)
