@@ -320,6 +320,28 @@ class SymetricMatrix {
 
 namespace Simplify
 {
+  // ==========================================================================
+  // [triflow] FORK ADDITIONS -- overview
+  // --------------------------------------------------------------------------
+  // This file is forked from upstream pyfqmr and customized for triflow.
+  // Search this file for "[triflow]" to find every non-trivial modified block.
+  //
+  // Added fields on Vertex:   custom_q, area, tid
+  // Added field on Triangle:  border[3]  (per-edge border flag)
+  // Added globals:            custom_quadratics[], has_target_vertex_ids,
+  //                           minimum_edge_length, border_weight,
+  //                           binary_search_steps, override_quadratics
+  // Added simplify_mesh args: custom_quadratics_param, target_vertex_ids,
+  //                           min_edge_length
+  // Modified behavior:        area-weighted quadrics, area-normalized error,
+  //                           per-edge borders, non-manifold pinch check,
+  //                           target-group split check, optimal-position
+  //                           safety fallback, flipped() full-ring scan,
+  //                           termination-on-no-progress.
+  //
+  // See README "What's different from upstream" for rationale.
+  // ==========================================================================
+
   // Global Variables & Strctures
   enum Attributes {
     NONE,
@@ -327,7 +349,12 @@ namespace Simplify
     TEXCOORD = 4,
     COLOR = 8
   };
+  // [triflow] Triangle::border[3]: per-edge border flag (replaces the
+  // upstream vertex-only border tracking).
   struct Triangle { int v[3];double err[4];int deleted,dirty,attr;vec3f n;vec3f uvs[3];int material;int border[3]; };
+  // [triflow] Vertex: adds custom_q (per-vertex user quadric), area
+  // (accumulated 1-ring area for area-weighted / normalized error), and
+  // tid (target-group id, -1 = ungrouped).
   struct Vertex { vec3f p;int tstart,tcount;SymetricMatrix q;SymetricMatrix custom_q;int border;double area; int tid; };
   struct Ref { int tid,tvertex; };
   std::vector<Triangle> triangles;
@@ -336,14 +363,17 @@ namespace Simplify
     std::string mtllib; //
     std::vector<std::string> materials; //
   
-  double* custom_quadratics;
-  int custom_quadratics_size;
-  bool has_target_vertex_ids = false;
-  bool override_quadratics = false;
-  double minimum_edge_length = -1.0;
+  // [triflow] fork globals
+  double* custom_quadratics;       // user-supplied per-vertex 4x4 quadric (10 values), owned by caller
+  int custom_quadratics_size;      // total double count (n_vertices * 10), 0 if unset
+  bool has_target_vertex_ids = false; // set when target_vertex_ids[] is passed to simplify_mesh()
+  double minimum_edge_length = -1.0;  // threshold for the intra-group short-edge collapse rule
 
-  double border_weight = 1000.0; // weight for border vertices
-  int binary_search_steps = 0; // steps for binary search when optimal position causes a flip
+  // [triflow][reserved] namespace-level tunables not wired to the Python API.
+  // Kept for future extensibility. Do not remove without updating README.
+  double border_weight = 1000.0;   // weight for the orthogonal border quadric
+  int binary_search_steps = 0;     // binary-search iterations for flip fallback in calculate_error()
+  bool override_quadratics = false;// future: replace-instead-of-add custom quadratic mode
 
   // Helper functions
 
@@ -363,6 +393,18 @@ namespace Simplify
   //                 more iterations yield higher quality
   //
 
+  // [triflow] Fork adds three trailing parameters:
+  //   custom_quadratics_param / custom_quadratics_size_param
+  //       Per-vertex user quadric matrices (n_vertices * 10 doubles).
+  //   target_vertex_ids / target_vertex_ids_size
+  //       Per-vertex int group id (or -1). Drives the target-aware
+  //       collapse rules in the main loop below.
+  //   min_edge_length
+  //       Threshold for the intra-group short-edge override.
+  // These parameters are optional; passing nullptr / 0 / -1.0 yields
+  // the standard (non-fork) behavior except for the always-on changes
+  // marked elsewhere in this file (area-weighted error, non-manifold
+  // pinch check, per-edge borders, etc.).
   void simplify_mesh(int target_count, int update_rate=5, double agressiveness=7,
                      void (*log)(char*, int)=NULL, int max_iterations=100, double alpha = 0.000000001,
                      int K = 3, bool lossless=false, double threshold_lossless = 0.0001,
@@ -436,10 +478,12 @@ namespace Simplify
           int i0=t.v[ j     ]; Vertex &v0 = vertices[i0];
           int i1=t.v[(j+1)%3]; Vertex &v1 = vertices[i1];
 
+          // [triflow] target-group collapse direction rules: once a vertex
+          // is tagged as belonging to a group, collapses can only flow
+          // *towards* a seed, never away from one.
           if (has_target_vertex_ids && v0.tid != -1 && v1.tid == -1) {
             continue; // only allow collapsing towards skeleton
           }
-
           if (has_target_vertex_ids && v0.tid != i0 && v1.tid == i1) {
             continue; // only allow collapsing towards seed
           }
@@ -448,8 +492,15 @@ namespace Simplify
           if(preserve_border){
             if (v0.border || v1.border) continue; // should keep border vertices
           }
-          if (v0.border && v1.border && !t.border[j]) continue; // prevent collapsing two sides of a border
+          // [triflow] edge-level border rule: allow collapse along a border
+          // edge, but reject when both endpoints are borders yet the shared
+          // edge is not (i.e. they're on two different border components).
+          if (v0.border && v1.border && !t.border[j]) continue;
 
+          // [triflow] target-group split check: reject a collapse between
+          // two different target groups unless the edge is short enough,
+          // and also reject any collapse that would disconnect v1's
+          // same-group ring neighbours (detected via union-find below).
           if (has_target_vertex_ids && v0.tid != v1.tid && v0.tid != -1 && v1.tid != -1) {
               if ((v0.p - v1.p).length() > minimum_edge_length) {
                   continue;
@@ -520,7 +571,13 @@ namespace Simplify
               }
           }
 
-          // check for manifold constraint
+          // [triflow] non-manifold pinch check: reject a collapse whose
+          // resulting vertex would have two disjoint triangle fans sharing
+          // only the collapsed vertex (i.e. a pinched / non-manifold point).
+          // Implemented by walking v0's ring, flagging every neighbour as
+          // "safe" if it appears on a triangle shared with v1, and then
+          // checking v1's ring for any shared neighbour that was not
+          // flagged safe.
           if (true) {
               int max_v0_neighbors = v0.tcount * 2;
               int* v0_neighbors = new int[max_v0_neighbors];
@@ -619,6 +676,8 @@ namespace Simplify
               v0.custom_q = v0.custom_q + v1.custom_q;
           }
           v0.area = v0.area + v1.area;
+          // [triflow] if v1 was a target-group seed, reassign every member
+          // of its group to i0 so the group's identity follows the seed.
           if (v1.tid == i1){
             loopk(0, vertices.size()){
               if (vertices[k].tid == i1){
@@ -626,6 +685,9 @@ namespace Simplify
               }
             }
           }
+          // [triflow] propagate edge-level border flags on collapse: any
+          // triangle of v0 that inherits a border neighbour from v1's
+          // ring needs its matching edge marked as a border.
           // update border
           bool was_v0_border = v0.border;
           bool was_v1_border = v1.border;
@@ -692,13 +754,17 @@ namespace Simplify
         // if (lossless) deleted_triangles = 0;
       }
 
-      // done?
+      // [triflow] termination: upstream only broke on target_count or,
+      // in lossless mode, on deleted_triangles<=0 (zeroed every iter).
+      // This fork also breaks when an iteration made no progress and
+      // the threshold has already saturated at threshold_lossless --
+      // i.e. further iterations cannot collapse anything new.
       if (lossless && (previous_deleted_triangles==deleted_triangles)){ break;
       } else if (!lossless && (triangle_count-deleted_triangles<=target_count)){break;
       } else if (!lossless && (previous_deleted_triangles==deleted_triangles) && threshold >= threshold_lossless ) {
         break;
       }
-      
+
       previous_deleted_triangles = deleted_triangles;
     }
     // clean up mesh
@@ -807,6 +873,12 @@ namespace Simplify
 
   // Check if a triangle flips when this edge is removed
 
+  // [triflow] No longer early-returns on the first bad triangle. Upstream
+  // returned true as soon as a flip was detected, leaving deleted[] only
+  // partially populated. This fork always scans the full 1-ring so
+  // deleted[] is fully filled -- required by the border-propagation code
+  // in the main simplify_mesh() collapse block, which reads deleted[k]
+  // for every k in v1's ring.
   bool flipped(vec3f p,int i0,int i1,Vertex &v0,Vertex &v1,std::vector<int> &deleted)
   {
     bool is_flipped=false;
@@ -951,6 +1023,8 @@ namespace Simplify
     {
       std::vector<int> vcount,vids;
 
+      // [triflow] also reset per-edge border flags Triangle::border[j],
+      // not just per-vertex Vertex::border as upstream did.
       loopi(0,vertices.size())
         vertices[i].border=0;
       loopi(0,triangles.size())
@@ -1045,10 +1119,15 @@ namespace Simplify
         n.normalize();
         t.n=n;
         loopj(0,3) {
+          // [triflow] accumulate per-vertex 1-ring area, used later for
+          // area-weighting quadrics and for normalizing reported error.
           vertices[t.v[j]].area += area;
           // distance to plane
           vertices[t.v[j]].q = vertices[t.v[j]].q+SymetricMatrix(n.x,n.y,n.z,-n.dot(p[0]));
-          // distance to plane orthogonal to triangle
+          // [triflow] for border edges, add a second quadric measuring
+          // distance to the plane *orthogonal* to the triangle that
+          // contains the border edge. Scaled by border_weight to pin
+          // border vertices in place.
           if ( border_weight > 0.0 && t.border[j] )
           {
             vec3f edge = p[(j + 1) % 3] - p[j];
@@ -1067,7 +1146,11 @@ namespace Simplify
         }
       }
 
-      // apply custom quadratics if provided
+      // [triflow] apply user-supplied custom quadratics. Stored on
+      // Vertex::custom_q separately from Vertex::q so that the reported
+      // geometric error in calculate_error() can still be computed
+      // against q (geometry-only) even though the collapse *position*
+      // is solved using q + custom_q.
       if ((log) && (iteration%5==0)) {
         char message[128];
         snprintf(message, 127, "apply custom quadratics if provided");
@@ -1103,7 +1186,10 @@ namespace Simplify
         }
       }
 
-      // weight quadratics by area
+      // [triflow] area-weight the quadrics so that larger triangles
+      // dominate the collapse error. Combined with area-normalized
+      // error in calculate_error(), this yields a scale-invariant
+      // simplification metric.
       loopi(0, vertices.size()) {
         double area = vertices[i].area;
         if (area > 0.0) {
@@ -1178,6 +1264,9 @@ namespace Simplify
   {
     // compute interpolated vertex
 
+    // [triflow] q_geom holds geometry-only quadric for error reporting;
+    // q is the solver quadric used to pick the collapse position and
+    // includes any user-supplied custom quadratic bias.
     SymetricMatrix q_geom = vertices[id_v1].q + vertices[id_v2].q;
     SymetricMatrix q = vertices[id_v1].q + vertices[id_v2].q;
     if ( custom_quadratics != nullptr && custom_quadratics_size > 0 )
@@ -1187,6 +1276,11 @@ namespace Simplify
     bool   border = vertices[id_v1].border & vertices[id_v2].border;
     double error=0;
     double det = q.det(0, 1, 2, 1, 4, 5, 2, 5, 7);
+    // [triflow] loosened fallback condition: upstream only fell back on
+    // singular q; we also fall back on near-singular q (det < 1e-6) and
+    // on optimal points that land implausibly far from the edge midpoint
+    // (see the opt_length check below). The binary_search_steps path
+    // is reserved but currently disabled (binary_search_steps == 0).
     bool fallback = det < 1e-6 ;
     bool is_flipped = false;
     if ( !fallback ) // det != 0 && !border
@@ -1258,6 +1352,10 @@ namespace Simplify
       }
     }
 
+    // [triflow] reported error is geometry-only (q_geom, not q) and
+    // normalized by the sum of endpoint 1-ring areas, yielding a
+    // scale-invariant metric that is comparable across meshes of
+    // very different absolute sizes.
     double raw_geom_error = vertex_error(q_geom, p_result.x, p_result.y, p_result.z);
     double total_area = vertices[id_v1].area + vertices[id_v2].area;
     double normalized_error = raw_geom_error / (total_area + 1e-6); // avoid division by zero
