@@ -1,4 +1,4 @@
 include VERSION
 include LICENSE
-include pyfqmr/Simplify.h
-include pyfqmr/Simplify.pyx
+include pyfqmr_triflow/Simplify.h
+include pyfqmr_triflow/Simplify.pyx

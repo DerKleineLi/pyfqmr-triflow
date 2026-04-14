@@ -34,7 +34,7 @@ cdef void log_message(char* message, int length) noexcept:
     if message is not NULL:
         from logging import getLogger
 
-        getLogger("pyfqmr").debug(message.decode("utf-8"))
+        getLogger("pyfqmr_triflow").debug(message.decode("utf-8"))
 
 cdef class Simplify :
 
@@ -173,7 +173,7 @@ cdef class Simplify :
         if verbose:
             from logging import getLogger
 
-            getLogger("pyfqmr").debug('simplified mesh in {} seconds from {} to {} triangles'.format(
+            getLogger("pyfqmr_triflow").debug('simplified mesh in {} seconds from {} to {} triangles'.format(
                 round(t_end-t_start,4), N_start, N_end)
             )
 
@@ -204,7 +204,7 @@ cdef class Simplify :
         if verbose:
             from logging import getLogger
 
-            getLogger("pyfqmr").debug('simplified mesh in {} seconds from {} to {} triangles'.format(
+            getLogger("pyfqmr_triflow").debug('simplified mesh in {} seconds from {} to {} triangles'.format(
                 round(t_end-t_start,4), N_start, N_end)
             )
 

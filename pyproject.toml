@@ -14,11 +14,11 @@ requires = [
 ]
 
 [project]
-name = "pyfqmr"
+name = "pyfqmr-triflow"
 authors = [
   { name = "kramer84" },
 ]
-description = "cython wrapper around C++ library for fast triangular mesh reduction"
+description = "triflow-customized cython wrapper around C++ library for fast triangular mesh reduction"
 readme = "README.rst"
 license = { text = "MIT" }
 
@@ -41,7 +41,7 @@ Homepage = "https://github.com/Kramer84/pyfqmr-Fast-quadric-Mesh-Reduction"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["pyfqmr"]
+packages = ["pyfqmr_triflow"]
 
 [tool.setuptools.dynamic]
 version = { file = "VERSION" }
